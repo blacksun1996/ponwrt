@@ -1,0 +1,212 @@
+name: Build latest PonWrt
+
+# Builds the newest pbs05/ponwrt code on a schedule. The fork's own
+# master branch is only a fork point; each run fetches upstream and
+# builds that tree, so the workflow file itself is never overwritten.
+
+on:
+  schedule:
+    # 02:00 Asia/Shanghai == 18:00 UTC on the previous day.
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Target to build
+        required: true
+        default: an7581
+        type: choice
+        options:
+          - an7581
+          - an7583
+          - all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-latest-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve targets
+    runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.matrix.outputs.targets }}
+    steps:
+      - id: matrix
+        env:
+          TARGET: ${{ inputs.target || 'an7581' }}
+        run: |
+          case "$TARGET" in
+            all) echo 'targets=["an7581","an7583"]' >> "$GITHUB_OUTPUT" ;;
+            an7583) echo 'targets=["an7583"]' >> "$GITHUB_OUTPUT" ;;
+            *) echo 'targets=["an7581"]' >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  # Optional: keep the fork's master in sync via GitHub's merge-upstream
+  # (a merge commit, so build-latest.yml survives). Never blocks the build.
+  sync-fork:
+    name: Sync fork master
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    permissions:
+      contents: write
+    steps:
+      - name: Merge upstream into fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/merge-upstream" \
+            -f branch=master \
+            && echo "Fork master merged with upstream." \
+            || echo "No merge performed (already current or conflict); build still uses upstream."
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.prepare.outputs.targets) }}
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          ref: master
+
+      - name: Fetch latest upstream code
+        id: upstream
+        run: |
+          git remote add upstream https://github.com/pbs05/ponwrt.git
+          git fetch --depth=1 upstream master
+          git reset --hard FETCH_HEAD
+          commit="$(git rev-parse --short HEAD)"
+          subject="$(git log -1 --pretty=%s)"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "subject=$subject" >> "$GITHUB_OUTPUT"
+          echo "Building upstream $commit: $subject"
+
+      - name: Free build space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name: Cache source downloads
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: ponwrt-dl-${{ matrix.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: |
+            ponwrt-dl-${{ matrix.target }}-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ponwrt-ccache-${{ matrix.target }}-${{ steps.upstream.outputs.commit }}
+          restore-keys: |
+            ponwrt-ccache-${{ matrix.target }}-
+
+      - name: Prepare ccache
+        run: ccache --max-size=2G
+
+      - name: Install feeds
+        run: |
+          retry() {
+            for i in 1 2 3; do
+              "$@" && return 0
+              echo "attempt $i failed: $*" >&2
+              sleep 15
+            done
+            return 1
+          }
+          retry ./scripts/feeds update -a
+          retry ./scripts/feeds install -a
+
+      - name: Configure ${{ matrix.target }}
+        run: |
+          ./scripts/kconfig.pl + "configs/${{ matrix.target }}.config" \
+            configs/release.config > .config
+          echo "CONFIG_CCACHE=y" >> .config
+          make defconfig
+
+      - name: Download sources
+        continue-on-error: true
+        run: |
+          make download -j"$(nproc)" || make download -j1 V=s
+
+      - name: Build ${{ matrix.target }}
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" 2>&1 | tee build.log
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.target }}-${{ steps.upstream.outputs.commit }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Pack ${{ matrix.target }}
+        run: |
+          mkdir -p release
+          tar --zstd -cf \
+            "release/ponwrt-${{ matrix.target }}-${{ steps.upstream.outputs.commit }}.tar.zst" \
+            -C bin/targets/airoha "${{ matrix.target }}"
+
+      - name: Upload ${{ matrix.target }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ponwrt-${{ matrix.target }}-${{ steps.upstream.outputs.commit }}
+          path: release/*.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        env:
+          TARGET: ${{ matrix.target }}
+          COMMIT: ${{ steps.upstream.outputs.commit }}
+          SUBJECT: ${{ steps.upstream.outputs.subject }}
+        run: |
+          {
+            echo "### PonWrt \`$TARGET\`"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| upstream commit | \`$COMMIT\` |"
+            echo "| upstream message | $SUBJECT |"
+            echo "| artifact | \`ponwrt-$TARGET-$COMMIT\` |"
+            echo ""
+            echo "Images:"
+            echo '```'
+            ls -lh "bin/targets/airoha/$TARGET" 2>/dev/null | \
+              grep -E '\.(bin|itb|img|tar)$' || echo "no images produced"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
