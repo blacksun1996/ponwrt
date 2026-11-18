@@ -3,6 +3,8 @@ name: Build latest PonWrt
 # Builds the newest pbs05/ponwrt code on a schedule. The fork's own
 # master branch is only a fork point; each run fetches upstream and
 # builds that tree, so the workflow file itself is never overwritten.
+# Finished tarballs are attached to the rolling "snapshot" prerelease
+# in addition to the workflow artifacts.
 
 on:
   schedule:
@@ -209,4 +211,79 @@ jobs:
             ls -lh "bin/targets/airoha/$TARGET" 2>/dev/null | \
               grep -E '\.(bin|itb|img|tar)$' || echo "no images produced"
             echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish snapshot release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ponwrt-*
+          path: release
+          merge-multiple: true
+
+      - name: Prepare checksums and release notes
+        id: meta
+        run: |
+          set -euo pipefail
+          cd release
+          ls -lh
+          sha256sum *.tar.zst > sha256sums
+          commit="$(ls *.tar.zst | head -n1 | sed -E 's/.*-([0-9a-f]{7,40})\.tar\.zst$/\1/')"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          {
+            echo "Automated snapshot built from \`pbs05/ponwrt\` upstream commit \`$commit\`."
+            echo ""
+            echo "| file | size |"
+            echo "| --- | --- |"
+            for f in *.tar.zst; do
+              echo "| \`$f\` | $(du -h "$f" | cut -f1) |"
+            done
+            echo ""
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > notes.md
+
+      - name: Publish to snapshot release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+
+          if gh release view snapshot --repo "$repo" >/dev/null 2>&1; then
+            # Drop the previous assets so the release always carries this run.
+            gh release view snapshot --repo "$repo" --json assets \
+              -q '.assets[].name' | while read -r name; do
+                [ -n "$name" ] || continue
+                gh release delete-asset snapshot "$name" --repo "$repo" --yes
+              done
+            gh release upload snapshot release/*.tar.zst release/sha256sums \
+              --repo "$repo" --clobber
+            gh release edit snapshot --repo "$repo" \
+              --title "PonWrt snapshot (${{ steps.meta.outputs.commit }})" \
+              --notes-file release/notes.md \
+              --prerelease
+          else
+            gh release create snapshot \
+              --repo "$repo" \
+              --target master \
+              --title "PonWrt snapshot (${{ steps.meta.outputs.commit }})" \
+              --notes-file release/notes.md \
+              --prerelease \
+              release/*.tar.zst release/sha256sums
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### Snapshot release"
+            echo ""
+            echo "Assets uploaded to: ${{ github.server_url }}/${{ github.repository }}/releases/tag/snapshot"
           } >> "$GITHUB_STEP_SUMMARY"
